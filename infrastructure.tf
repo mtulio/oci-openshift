@@ -102,7 +102,30 @@ variable "openshift_image_source_uri" {
   description = "The OCI Object Storage URL for the OpenShift image. Before provisioning resources through this Resource Manager stack, users should upload the OpenShift image to OCI Object Storage, create a pre-authenticated requests (PAR) uri, and paste the uri to this block. For more detail regarding Object storage and PAR, please visit https://docs.oracle.com/en-us/iaas/Content/Object/Concepts/objectstorageoverview.htm and https://docs.oracle.com/en-us/iaas/Content/Object/Tasks/usingpreauthenticatedrequests.htm ."
 }
 
-#Provider
+variable "create_bootstrap" {
+  type = bool
+  default = false
+  description = "create bootstrap node"
+}
+
+variable "ccm_namespace" {
+  type = string
+  default = "oci-cloud-controller-manager"
+  description = "OCI Cloud Controller Manager namespace used to build the secret configuration."
+}
+
+variable "ccm_config_output_filename" {
+  type = string
+  default = "tf-output.oci_ccm_config_secret.yaml"
+  description = "OCI Cloud Controller Manager secret manifest file name."
+}
+
+variable "compartment_dns_ocid" {
+  type = string
+  description = "custom DNS name to setup public DNS address"
+}
+
+# Provider
 provider oci {
 	region = var.home_region
 }
@@ -111,6 +134,7 @@ locals {
   all_protocols = "all"
   anywhere      = "0.0.0.0/0"
   create_openshift_instance_pools = true
+  pool_formatter_id = join("", ["$", "{launchCount}"])
 }
 
 data oci_identity_availability_domain availability_domain {
@@ -194,7 +218,8 @@ resource oci_core_vcn openshift_vcn {
   ]
   compartment_id = var.compartment_ocid
   display_name   = var.cluster_name
-  dns_label      = var.cluster_name
+  #dns_label      = trim(var.cluster_name, "-")
+  dns_label      = "oci"
 }
 
 resource "oci_core_internet_gateway" "internet_gateway" {
@@ -308,7 +333,7 @@ resource "oci_core_subnet" "private" {
     oci_core_security_list.private.id,
   ]
 
-  dns_label                  = "private"
+  dns_label                  = "int"
   prohibit_public_ip_on_vnic = true
 }
 
@@ -439,10 +464,14 @@ resource "oci_core_network_security_group_security_rule" "cluster_compute_nsg_2"
   source                    = var.vcn_cidr
 }
 
+#
+# Load Balancer
+#
+
 resource "oci_network_load_balancer_network_load_balancer" "openshift_lb" {
   compartment_id             = var.compartment_ocid
   subnet_id                  = oci_core_subnet.public.id
-  display_name               = "openshift_lb"
+  display_name               = "${var.cluster_name}"
   is_private                 = false
   network_security_group_ids = [oci_core_network_security_group.cluster_lb_nsg.id]
 }
@@ -546,6 +575,10 @@ resource "oci_network_load_balancer_listener" "openshift_cluster_infra-mcs" {
     depends_on               = [oci_network_load_balancer_backend_set.openshift_cluster_infra-mcs_backend]
 }
 
+#
+# IAM
+#
+
 resource "oci_identity_dynamic_group" "openshift_master_nodes" {
     compartment_id = var.tenancy_ocid
     description    = "OpenShift master nodes" 
@@ -572,6 +605,10 @@ resource "oci_identity_dynamic_group" "openshift_worker_nodes" {
   matching_rule  = "all {instance.compartment.id='${var.compartment_ocid}', tag.openshift-${var.cluster_name}.instance-role.value='worker'}"
   name           = "${var.cluster_name}_worker_nodes"
 }
+
+#
+# DNS
+#
 
 resource oci_dns_zone openshift {
   compartment_id = var.compartment_ocid
@@ -618,6 +655,41 @@ resource oci_dns_rrset openshift_api_int {
   zone_name_or_id = oci_dns_zone.openshift.id
 }
 
+# resource oci_dns_zone openshift_public {
+#   compartment_id = var.compartment_dns_ocid
+#   name           = var.zone_dns
+#   scope          = "GLOBAL"
+#   zone_type      = "PRIMARY"
+# }
+
+resource oci_dns_rrset openshift_public_api {
+  domain = "api.${var.cluster_name}.${var.zone_dns}"
+  items {
+    domain = "api.${var.cluster_name}.${var.zone_dns}"
+    rdata  = local.lb_public_addr
+    rtype  = "A"
+    ttl    = "30"
+  }
+  rtype           = "A"
+  zone_name_or_id = var.zone_dns
+  scope = "GLOBAL"
+  compartment_id = "${var.compartment_dns_ocid}"
+}
+
+resource oci_dns_rrset openshift_public_apps {
+  domain = "*.apps.${var.cluster_name}.${var.zone_dns}"
+  items {
+    domain = "*.apps.${var.cluster_name}.${var.zone_dns}"
+    rdata  = local.lb_public_addr
+    rtype  = "A"
+    ttl    = "30"
+  }
+  rtype           = "A"
+  zone_name_or_id = var.zone_dns
+  scope = "GLOBAL"
+  compartment_id = "${var.compartment_dns_ocid}"
+}
+
 resource "time_sleep" "wait_180_seconds" {
   depends_on = [oci_core_vcn.openshift_vcn]
   create_duration = "180s"
@@ -635,6 +707,10 @@ data "oci_dns_resolver" "dns_resolver" {
   resolver_id = data.oci_core_vcn_dns_resolver_association.dns_resolver_association.dns_resolver_id
   scope       = "PRIVATE"
 }
+
+#
+# Compute
+#
 
 resource oci_core_instance_configuration master_node_config {
   count          = local.create_openshift_instance_pools ? 1 : 0
@@ -667,15 +743,21 @@ resource oci_core_instance_configuration master_node_config {
         image_id                = oci_core_image.openshift_image[0].id
         source_type             = "image"
       }
+      metadata = {
+        user_data = base64encode(data.local_file.master_ign.content)
+      }
     }
   }
 }
 
 resource oci_core_instance_pool master_nodes {
-  count                     = local.create_openshift_instance_pools ? 1 : 0
-  compartment_id            = var.compartment_ocid
-  display_name              = "${var.cluster_name}-master"
-  instance_configuration_id = oci_core_instance_configuration.master_node_config[0].id
+  count                           = local.create_openshift_instance_pools ? 1 : 0
+  compartment_id                  = var.compartment_ocid
+  display_name                    = "${var.cluster_name}-master"
+  instance_configuration_id       = oci_core_instance_configuration.master_node_config[0].id
+  size                            = var.master_count
+  instance_display_name_formatter = "${var.cluster_name}-master-${local.pool_formatter_id}"
+  instance_hostname_formatter     = "${var.cluster_name}-master-${local.pool_formatter_id}"
   load_balancers {
     backend_set_name = oci_network_load_balancer_backend_set.openshift_cluster_api_backend.name
     load_balancer_id = oci_network_load_balancer_network_load_balancer.openshift_lb.id
@@ -698,7 +780,6 @@ resource oci_core_instance_pool master_nodes {
     availability_domain = data.oci_identity_availability_domain.availability_domain.name
     primary_subnet_id   = oci_core_subnet.private.id
   }
-  size       = var.master_count
   depends_on = [
     oci_network_load_balancer_backend_set.openshift_cluster_api_backend,
     oci_network_load_balancer_backend_set.openshift_cluster_infra-mcs_backend,
@@ -738,6 +819,9 @@ resource oci_core_instance_configuration worker_node_config {
         image_id                = oci_core_image.openshift_image[0].id
         source_type             = "image"
       }
+      metadata = {
+        user_data = base64encode(data.local_file.worker_ign.content)
+      }
     }
   }
 }
@@ -747,6 +831,9 @@ resource oci_core_instance_pool worker_nodes {
   compartment_id            = var.compartment_ocid
   display_name              = "${var.cluster_name}-worker"
   instance_configuration_id = oci_core_instance_configuration.worker_node_config[0].id
+  size       = var.worker_count
+  instance_display_name_formatter = "${var.cluster_name}-worker-${local.pool_formatter_id}"
+  instance_hostname_formatter     = "${var.cluster_name}-worker-${local.pool_formatter_id}"
   load_balancers {
     backend_set_name = oci_network_load_balancer_backend_set.openshift_cluster_ingress_https_backend.name
     load_balancer_id = oci_network_load_balancer_network_load_balancer.openshift_lb.id
@@ -763,7 +850,6 @@ resource oci_core_instance_pool worker_nodes {
     availability_domain = data.oci_identity_availability_domain.availability_domain.name
     primary_subnet_id   = oci_core_subnet.private.id
   }
-  size       = var.worker_count
   depends_on = [
     oci_network_load_balancer_backend_set.openshift_cluster_ingress_https_backend,
     oci_network_load_balancer_backend_set.openshift_cluster_ingress_http_backend,
@@ -794,6 +880,33 @@ rateLimiter:
   rateLimitBucketRead: 5
   rateLimitQPSWrite: 20.0
   rateLimitBucketWrite: 5
+  OCICCMCONFIG
+}
+
+resource "local_file" "oci_ccm_config" {
+  filename = "${path.module}/${var.ccm_config_output_filename}"
+  content  = <<OCICCMCONFIG
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: oci-cloud-controller-manager
+  namespace: ${var.ccm_namespace}
+stringData:
+  cloud-provider.yaml: |
+    useInstancePrincipals: true
+    compartment: ${var.compartment_ocid}
+    vcn: ${oci_core_vcn.openshift_vcn.id}
+    loadBalancer:
+      subnet1: ${oci_core_subnet.public.id}
+      securityListManagementMode: Frontend
+      securityLists:
+        ${oci_core_subnet.public.id}: ${oci_core_security_list.public.id}
+    rateLimiter:
+      rateLimitQPSRead: 20.0
+      rateLimitBucketRead: 5
+      rateLimitQPSWrite: 20.0
+      rateLimitBucketWrite: 5
   OCICCMCONFIG
 }
 
@@ -832,4 +945,96 @@ resource "oci_core_network_security_group_security_rule" "cluster_lb_nsg_rule_7"
       max = 22624
     }
   }
+}
+
+
+## UPI specific
+
+data "local_file" "bootstrap_ign" {
+  count    = var.create_bootstrap ? 1 : 0
+  filename = "${path.module}/bootstrap-upi.ign"
+}
+
+data "local_file" "master_ign" {
+  filename = "${path.module}/master.ign"
+}
+
+data "local_file" "worker_ign" {
+  filename = "${path.module}/worker.ign"
+}
+
+resource oci_core_instance_configuration bootstrap_node_config {
+  count          = var.create_bootstrap ? 1 : 0
+  compartment_id = var.compartment_ocid
+  display_name   = "${var.cluster_name}-bootstrap"
+  instance_details {
+    instance_type = "compute"
+    launch_details {
+      availability_domain = data.oci_identity_availability_domain.availability_domain.name
+      compartment_id      = var.compartment_ocid
+      create_vnic_details {
+        assign_private_dns_record = "true"
+        assign_public_ip          = "true"
+        nsg_ids                   = [
+          oci_core_network_security_group.cluster_controlplane_nsg.id,
+        ]
+        subnet_id = oci_core_subnet.public.id
+      }
+      defined_tags = {
+        "openshift-${var.cluster_name}.instance-role" = "master"
+      }
+      shape = var.master_shape
+      shape_config {
+        memory_in_gbs = var.master_memory
+        ocpus         = var.master_ocpu
+      }
+      source_details {
+        boot_volume_size_in_gbs = var.master_boot_size
+        boot_volume_vpus_per_gb = var.master_boot_volume_vpus_per_gb
+        image_id                = oci_core_image.openshift_image[0].id
+        source_type             = "image"
+      }
+      metadata = {
+        user_data = base64encode(data.local_file.bootstrap_ign[0].content)
+      }
+    }
+  }
+}
+
+resource oci_core_instance_pool bootstrap_node {
+  count                     = var.create_bootstrap ? 1 : 0
+  compartment_id            = var.compartment_ocid
+  display_name              = "${var.cluster_name}-bootstrap"
+  instance_configuration_id = oci_core_instance_configuration.bootstrap_node_config[0].id
+  size                      = 1
+  instance_display_name_formatter = "${var.cluster_name}-bootstrap-${local.pool_formatter_id}"
+  instance_hostname_formatter = "${var.cluster_name}-bootstrap-${local.pool_formatter_id}"
+  load_balancers {
+    backend_set_name = oci_network_load_balancer_backend_set.openshift_cluster_api_backend.name
+    load_balancer_id = oci_network_load_balancer_network_load_balancer.openshift_lb.id
+    port             = "6443"
+    vnic_selection   = "PrimaryVnic"
+  }
+  load_balancers {
+    backend_set_name = oci_network_load_balancer_backend_set.openshift_cluster_infra-mcs_backend.name
+    load_balancer_id = oci_network_load_balancer_network_load_balancer.openshift_lb.id
+    port             = "22623"
+    vnic_selection   = "PrimaryVnic"
+  }
+  load_balancers {
+    backend_set_name = oci_network_load_balancer_backend_set.openshift_cluster_infra-mcs_backend_2.name
+    load_balancer_id = oci_network_load_balancer_network_load_balancer.openshift_lb.id
+    port             = "22624"
+    vnic_selection   = "PrimaryVnic"
+  }
+  placement_configurations {
+    availability_domain = data.oci_identity_availability_domain.availability_domain.name
+    primary_subnet_id   = oci_core_subnet.public.id
+  }
+  depends_on = [
+    oci_network_load_balancer_backend_set.openshift_cluster_api_backend,
+    oci_network_load_balancer_backend_set.openshift_cluster_infra-mcs_backend,
+    oci_network_load_balancer_backend_set.openshift_cluster_infra-mcs_backend_2,
+    oci_core_instance_configuration.bootstrap_node_config,
+  ]
 }
