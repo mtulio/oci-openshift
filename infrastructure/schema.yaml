@@ -40,6 +40,7 @@ variableGroups:
 - title: "Networking Configuration"
   variables:
     - enable_private_dns
+    - use_existing_zone
     - zone_dns
     - vcn_dns_label
     - vcn_cidr
@@ -208,6 +209,12 @@ variables:
     title: Enable Private DNS
     description: If the switch is enabled, a private DNS zone will be created, and users should edit the /etc/hosts file for resolution. Otherwise, a public DNS zone will be created based on the given domain.
     default: false
+
+  use_existing_zone:
+    type: string
+    title: Use Existing DNS Zone name
+    description: When defined, a public DNS zone will be used instead of creating a new one. This name used to be the same of baseDomain when setting up OpenShift ISO.
+    default: ""
 
   zone_dns:
     type: string

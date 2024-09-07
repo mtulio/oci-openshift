@@ -613,6 +613,7 @@ resource "oci_dns_zone" "openshift" {
   name           = var.zone_dns
   scope          = var.enable_private_dns ? "PRIVATE" : null
   view_id        = var.enable_private_dns ? data.oci_dns_resolver.dns_resolver.default_view_id : null
+  count          = length(var.use_existing_zone) == 0 ? 1 : 0
   zone_type      = "PRIMARY"
   depends_on     = [oci_core_subnet.private]
 }
@@ -626,7 +627,7 @@ resource "oci_dns_rrset" "openshift_api" {
     ttl    = "3600"
   }
   rtype           = "A"
-  zone_name_or_id = oci_dns_zone.openshift.id
+  zone_name_or_id = length(var.use_existing_zone) == 0 ? oci_dns_zone.openshift[0].id : var.use_existing_zone
 }
 
 resource "oci_dns_rrset" "openshift_apps" {
@@ -638,7 +639,7 @@ resource "oci_dns_rrset" "openshift_apps" {
     ttl    = "3600"
   }
   rtype           = "A"
-  zone_name_or_id = oci_dns_zone.openshift.id
+  zone_name_or_id = length(var.use_existing_zone) == 0 ? oci_dns_zone.openshift[0].id : var.use_existing_zone
 }
 
 resource "oci_dns_rrset" "openshift_api_int" {
@@ -650,7 +651,7 @@ resource "oci_dns_rrset" "openshift_api_int" {
     ttl    = "3600"
   }
   rtype           = "A"
-  zone_name_or_id = oci_dns_zone.openshift.id
+  zone_name_or_id = length(var.use_existing_zone) == 0 ? oci_dns_zone.openshift[0].id : var.use_existing_zone
 }
 
 resource "time_sleep" "wait_180_seconds" {
@@ -709,6 +710,7 @@ resource "oci_core_instance" "control_plane_node" {
   for_each            = var.create_openshift_instances ? local.cp_node_map : {}
   compartment_id      = var.compartment_ocid
   availability_domain = each.value.ad_name
+  fault_domain        = "FAULT-DOMAIN-${each.value.index}"
   display_name        = "${var.cluster_name}-cp-${each.value.index}-ad${regex("\\d+$", each.value.ad_name)}"
   shape               = var.control_plane_shape
   defined_tags = {
@@ -745,6 +747,7 @@ resource "oci_core_instance" "compute_node" {
   for_each            = var.create_openshift_instances ? local.compute_node_map : {}
   compartment_id      = var.compartment_ocid
   availability_domain = each.value.ad_name
+  fault_domain        = "FAULT-DOMAIN-${each.value.index}"
   display_name        = "${var.cluster_name}-compute-${each.value.index}-ad${regex("\\d+$", each.value.ad_name)}"
   shape               = var.compute_shape
   defined_tags = {

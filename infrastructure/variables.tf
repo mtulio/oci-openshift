@@ -3,6 +3,8 @@ variable "zone_dns" {
   description = "The name of cluster's DNS zone. This name must be the same as what was specified during OpenShift ISO creation. The zone_dns value must be a valid hostname."
 }
 
+
+
 variable "control_plane_count" {
   default     = 3
   type        = number
@@ -197,6 +199,12 @@ variable "enable_private_dns" {
   type        = bool
   description = "If the switch is enabled, a private DNS zone will be created, and users should edit the /etc/hosts file for resolution. Otherwise, a public DNS zone will be created based on the given domain."
   default     = false
+}
+
+variable "use_existing_zone" {
+  type        = string
+  description = "When set, a public DNS zone will be used instead of creating a new one."
+  default     = ""
 }
 
 variable "create_openshift_instances" {
